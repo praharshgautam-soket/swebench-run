@@ -4,9 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "swebench-run"
-version = "0.1.0"
-description = "Run SWE-bench with pluggable agent harnesses and model providers on Kubernetes"
-requires-python = ">=3.11"
+version = "0.2.0"
+description = "Run SWE-bench Lite with pluggable agent harnesses (Loop, DeepSeek Harness) and model providers on Kubernetes"
+requires-python = ">=3.10"
 dependencies = [
     "pyyaml>=6",
     "kubernetes>=29",
@@ -26,7 +26,7 @@ swebench-run = "swebench_run.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-swebench_run = ["assets/*"]
+swebench_run = ["assets/*", "bundles/*/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

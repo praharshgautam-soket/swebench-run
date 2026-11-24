@@ -21,13 +21,14 @@ class ConfigError(ValueError):
 
 
 # kind -> (default base_url, default api-key env var). A None base_url means the
-# user must supply one; Soket's gateway URL is deliberately not guessed.
+# user must supply one. Soket's URL is the one Loop's own source ships as its default.
 PROVIDER_PRESETS: dict[str, tuple[str | None, str | None]] = {
     "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
     "openai-compatible": (None, None),
-    "soket": (None, "SOKET_API_KEY"),
+    "soket": ("https://api.soket.ai/v1", "SOKET_API_KEY"),
 }
 
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,40}$")
 _DNS_LABEL = re.compile(r"^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$")
 # The Loop entrypoint writes these into a JSON file with plain shell
@@ -81,20 +82,43 @@ class K8sConfig:
         default_factory=lambda: {"kubernetes.io/arch": "amd64"}
     )
     tolerations: list[dict[str, Any]] = field(default_factory=list)
+    # Restrict pods to these node names (kubernetes.io/hostname). Empty = any node
+    # the selector and taints allow.
+    allowed_nodes: list[str] = field(default_factory=list)
+    # PriorityClass for our pods. A negative-priority class with preemptionPolicy
+    # Never makes us yield to everyone else's pods and never evict anyone.
+    priority_class: str = ""
     image_pull_secrets: list[str] = field(default_factory=list)
     image_pull_policy: str = "IfNotPresent"
     # Docker Hub namespace of the prebuilt instance images.
     instance_image_namespace: str = "swebench"
-    # Image holding the harness bundle; defaults to <name>-bundle, set by the user.
+    # Image holding the harness bundle. Empty = fetch mode: an init container
+    # downloads the agent, so no registry is needed.
     harness_image: str = ""
-    cpu_request: str = "2"
-    cpu_limit: str = "4"
-    memory_request: str = "4Gi"
-    memory_limit: str = "8Gi"
+    fetch_image: str = "curlimages/curl:8.10.1"
+    # Keep the footprint small: the workers are shared with GPU jobs.
+    cpu_request: str = "1"
+    cpu_limit: str = "2"
+    memory_request: str = "2Gi"
+    memory_limit: str = "6Gi"
     ephemeral_storage_request: str = "10Gi"
     ephemeral_storage_limit: str = "30Gi"
     # Instance images are multi-GB; allow a long Pending phase for the pull.
     pod_start_timeout_sec: int = 1800
+
+
+@dataclass
+class MeterConfig:
+    """Optional metering proxy between the agent pods and the model API."""
+
+    enabled: bool = False
+    name: str = "sbr-meter"
+    port: int = 8080
+    image: str = "python:3.12-slim"
+    # Secret with keys `upstream-key` (the real API key) and `meter-token` (what pods use).
+    secret_name: str = "swebench-meter"
+    max_concurrency: int = 8
+    max_retries: int = 5
 
 
 @dataclass
@@ -106,6 +130,7 @@ class RunConfig:
     workers: int = 4
     limits: Limits = field(default_factory=Limits)
     k8s: K8sConfig = field(default_factory=K8sConfig)
+    meter: MeterConfig = field(default_factory=MeterConfig)
     output_dir: str = "results"
     # Extra attempts after the first, for infra errors only.
     max_retries: int = 2
@@ -158,6 +183,12 @@ class RunConfig:
             raise ConfigError("provider.base_url must be an http(s) URL")
         if not p.api_key_env:
             raise ConfigError("provider.api_key_env is required")
+        if not _ENV_NAME.match(p.api_key_env) or len(p.api_key_env) > 64:
+            # Never echo the value: a pasted API key would end up in the error text.
+            raise ConfigError(
+                "provider.api_key_env must be the NAME of an environment variable "
+                "(like SOKET_API_KEY), not the key itself"
+            )
         for name, value in (("provider.base_url", p.base_url), ("provider.model", p.model)):
             if _SHELL_JSON_UNSAFE.search(value):
                 raise ConfigError(f"{name} must not contain quotes, backslashes or spaces")
@@ -174,6 +205,9 @@ class RunConfig:
             raise ConfigError("limits.max_steps / timeout_sec / eval_timeout_sec must be > 0")
         if lim.max_cost_usd is not None and lim.max_cost_usd <= 0:
             raise ConfigError("limits.max_cost_usd must be > 0 when set")
+        m = self.meter
+        if not _DNS_LABEL.match(m.name) or not (1 <= m.port <= 65535) or m.max_concurrency < 1 or m.max_retries < 0:
+            raise ConfigError("meter: name must be a DNS label, port 1-65535, max_concurrency >= 1, max_retries >= 0")
         sub = self.dataset.subset
         if sub.instance_ids and sub.first_n:
             raise ConfigError("dataset.subset: set instance_ids or first_n, not both")

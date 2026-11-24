@@ -19,7 +19,8 @@ from typing import Callable, Iterable
 from .cluster import Cluster
 from .config import RunConfig
 from .contract import extract_result, strip_result_block
-from .manifests import DEADLINE_GRACE_SEC, eval_objects, inference_objects
+from .manifests import DEADLINE_GRACE_SEC, eval_objects, inference_objects, instance_key
+from .meter import MeterClient, stats_to_usage
 from .prompt import build_prompt
 from .state import (
     EV_INFRA,
@@ -74,21 +75,35 @@ class Runner:
         instances: dict[str, InstanceSpec],
         grader: Grader,
         sleep: Callable[[float], None] = time.sleep,
-        log: Callable[[str], None] = print,
+        log: Callable[[str], None] = lambda m: print(m, flush=True),
+        meter: MeterClient | None = None,
     ):
         self.cfg, self.store, self.cluster = cfg, store, cluster
         self.instances, self.grader = instances, grader
         self.sleep, self.log = sleep, log
+        self.meter = meter
 
     # -- stages -----------------------------------------------------------
 
     def infer(self, inst: InstanceSpec) -> None:
         cfg, st = self.cfg, self.store.load(inst.instance_id)
+        if self.meter and st.inference.attempts == 0 and st.needs_inference(cfg.max_retries):
+            # Fresh start for this instance. Retries keep adding to the same counters, so
+            # the report shows what was really spent, including attempts that failed.
+            self.log(f"[{inst.instance_id}] resetting meter counters")
+            self._meter_call(self.meter.reset, inst.instance_id)
         while st.needs_inference(cfg.max_retries):
             st.inference.attempts += 1
             began = time.time()
+            self.log(f"[{inst.instance_id}] inference: started (attempt {st.inference.attempts})")
             status, error = self._infer_once(inst, st)
+            if self.meter:
+                stats = self._meter_call(self.meter.usage, inst.instance_id)
+                if stats and stats.get("calls"):
+                    self._record_usage(st, stats_to_usage(stats))
             st.inference.status, st.inference.error = status, error
+            if status != INF_INFRA:  # an infra failure never reached the model
+                st.provider, st.model = cfg.provider.kind, cfg.provider.model
             st.inference.wall_sec = round(time.time() - began, 1)
             st.inference.finished_at = now()
             self.store.save(st)
@@ -116,10 +131,43 @@ class Runner:
                 rel = name if name.startswith("trajectory/") else f"trajectory/{name}"
                 self.store.write(inst.instance_id, rel, data)
         st.patch_bytes = len(bundle.files.get("patch.diff", b"").strip())
-        self._record_usage(st, bundle.usage)
+        if not self.meter:
+            self._record_usage(st, bundle.usage)
 
         meta_status = bundle.meta.get("status")
-        return {"ok": INF_OK, "timeout": INF_TIMEOUT}.get(meta_status, INF_AGENT_ERROR), None
+        status = {"ok": INF_OK, "timeout": INF_TIMEOUT}.get(meta_status, INF_AGENT_ERROR)
+        if status != INF_OK and self.meter is not None:
+            stats = self._meter_call(self.meter.usage, inst.instance_id)
+            if stats and stats.get("calls") and not stats.get("ok_calls"):
+                # Every call to the model API failed (out of credit, bad key, rate limit...).
+                # That is the account's problem, not the model's: retry later, never record a final agent_error.
+                return INF_INFRA, "the model API rejected every call (check credit, key and limits)"
+        if status == INF_AGENT_ERROR and self.meter is not None:
+            stats = self._meter_call(self.meter.usage, inst.instance_id)
+            if stats and stats.get("truncated"):
+                # The model API cut a streamed answer short and the agent died on the broken
+                # stream. That is the API's fault, not the task's: retry instead of recording
+                # a final agent_error.
+                return INF_INFRA, f"the model API cut {stats['truncated']} streamed answer(s) short"
+        if status != INF_OK and self.meter is not None and not self._meter_healthy():
+            # The agent's model calls go through the proxy; if it is down, the failure is the
+            # cluster's, not the task's. Retry instead of recording a final agent_error.
+            return INF_INFRA, "metering proxy unavailable during the run"
+        return status, None
+
+    def _meter_healthy(self) -> bool:
+        try:
+            return bool(self.meter.healthy())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _meter_call(self, fn, instance_id: str):
+        """Metering is advisory: a failure to reach the proxy never fails an instance."""
+        try:
+            return fn(instance_key(instance_id))
+        except Exception as e:  # noqa: BLE001
+            self.log(f"[{instance_id}] meter unavailable: {type(e).__name__}")
+            return None
 
     def _record_usage(self, st: InstanceState, usage: dict) -> None:
         st.steps = usage.get("steps")
@@ -154,6 +202,7 @@ class Runner:
         while st.eval.retryable(cfg.max_retries):
             st.eval.attempts += 1
             began = time.time()
+            self.log(f"[{inst.instance_id}] eval: started (attempt {st.eval.attempts})")
             status, error = self._eval_once(inst)
             st.eval.status, st.eval.error = status, error
             st.eval.wall_sec = round(time.time() - began, 1)
@@ -245,3 +294,27 @@ class Runner:
                 for f in futures:
                     f.cancel()
                 raise
+
+
+def fill_usage_from_meter(cfg: RunConfig, store: Store, meter: MeterClient, log: Callable[[str], None] = lambda m: print(m, flush=True)) -> int:
+    """Copy the proxy's counters into stored results that have no usage yet.
+
+    Lets a report be rebuilt after a run where the proxy could not be read at the time.
+    Returns how many instances were filled. Never overwrites numbers already recorded.
+    """
+    helper = Runner(cfg, store, None, {}, lambda *a: (False, {}), log=log)  # type: ignore[arg-type]
+    filled = 0
+    for st in store.all_states():
+        if st.input_tokens is not None:
+            continue
+        try:
+            stats = meter.usage(instance_key(st.instance_id))
+        except Exception as e:  # noqa: BLE001
+            log(f"[{st.instance_id}] meter unavailable: {type(e).__name__}")
+            continue
+        usage = stats_to_usage(stats)
+        if usage:
+            helper._record_usage(st, usage)
+            store.save(st)
+            filled += 1
+    return filled

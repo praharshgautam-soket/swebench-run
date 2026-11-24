@@ -14,6 +14,24 @@ from .state import FINAL_STATUSES, InstanceState, Store
 _NOT_ATTEMPTED = {"infra_error", "pending"}
 
 
+def _label(st: InstanceState) -> str:
+    return f"{st.provider}/{st.model}" if st.provider and st.model else "unrecorded"
+
+
+def _by_provider(states: list[InstanceState]) -> dict[str, dict[str, Any]]:
+    """Per provider/model: how many tasks and how many resolved. Only tasks that reached a verdict."""
+    out: dict[str, dict[str, Any]] = {}
+    for st in states:
+        if st.final_status in _NOT_ATTEMPTED:
+            continue
+        row = out.setdefault(_label(st), {"tasks": 0, "resolved": 0})
+        row["tasks"] += 1
+        row["resolved"] += 1 if st.final_status == "resolved" else 0
+    for row in out.values():
+        row["resolved_pct"] = round(100 * row["resolved"] / row["tasks"], 2) if row["tasks"] else None
+    return out
+
+
 def build_report(cfg: RunConfig, states: list[InstanceState], total_instances: int | None = None) -> dict[str, Any]:
     total = total_instances if total_instances is not None else len(states)
     counts = {s: 0 for s in FINAL_STATUSES}
@@ -22,6 +40,7 @@ def build_report(cfg: RunConfig, states: list[InstanceState], total_instances: i
     # Instances in the dataset subset that have no state yet are pending too.
     counts["pending"] += max(0, total - len(states))
 
+    by_provider = _by_provider(states)
     attempted = sum(n for s, n in counts.items() if s not in _NOT_ATTEMPTED)
     resolved = counts["resolved"]
 
@@ -34,6 +53,7 @@ def build_report(cfg: RunConfig, states: list[InstanceState], total_instances: i
             {
                 "instance_id": st.instance_id,
                 "status": st.final_status,
+                "provider": _label(st),
                 "inference_status": st.inference.status,
                 "eval_status": st.eval.status,
                 "error": st.eval.error or st.inference.error,
@@ -62,6 +82,8 @@ def build_report(cfg: RunConfig, states: list[InstanceState], total_instances: i
             "resolved_pct_of_attempted": round(100 * resolved / attempted, 2) if attempted else None,
         },
         "counts": counts,
+        "by_provider": by_provider,
+        "mixed_providers": len(by_provider) > 1,
         "totals": {
             # None when no harness reported usage; never a made-up zero.
             "cost_usd": round(sum(costs), 4) if costs else None,
@@ -88,7 +110,7 @@ def write_predictions(cfg: RunConfig, store: Store, states: list[InstanceState])
                 json.dumps(
                     {
                         "instance_id": st.instance_id,
-                        "model_name_or_path": f"{cfg.harness.name}__{cfg.provider.model}",
+                        "model_name_or_path": f"{cfg.harness.name}__{st.model or cfg.provider.model}",
                         "model_patch": store.read_text(st.instance_id, "patch.diff"),
                     }
                 )
@@ -117,6 +139,11 @@ def render_markdown(r: dict[str, Any]) -> str:
         "|---|---|",
     ]
     lines += [f"| {s} | {n} |" for s, n in r["counts"].items() if n]
+    if r.get("mixed_providers"):
+        lines += ["", "**This run mixes providers.** Results by provider/model:", "",
+                  "| Provider / model | Tasks | Resolved | % |", "|---|---|---|---|"]
+        for name, row in sorted(r["by_provider"].items()):
+            lines.append(f"| {name} | {row['tasks']} | {row['resolved']} | {_fmt(row['resolved_pct'], 1)} |")
     lines += [
         "",
         f"Total cost: {_fmt(t['cost_usd'])} USD (reported for {t['cost_reported_for']} instance(s)). "
@@ -148,6 +175,14 @@ def render_html(r: dict[str, Any]) -> str:
         for i in r["instances"]
     )
     counts = "".join(f"<li>{e(s)}: {n}</li>" for s, n in r["counts"].items() if n)
+    providers = ""
+    if r.get("mixed_providers"):
+        rows_p = "".join(
+            f"<tr><td>{e(k)}</td><td>{v['tasks']}</td><td>{v['resolved']}</td><td>{_fmt(v['resolved_pct'], 1)}</td></tr>"
+            for k, v in sorted(r["by_provider"].items())
+        )
+        providers = ("<p><b>This run mixes providers.</b></p><table><tr><th>Provider / model</th><th>Tasks</th>"
+                     f"<th>Resolved</th><th>%</th></tr>{rows_p}</table>")
     return f"""<!doctype html><meta charset="utf-8">
 <title>SWE-bench report {e(r['run_id'])}</title>
 <style>body{{font:14px system-ui;margin:2rem}}table{{border-collapse:collapse}}
@@ -157,6 +192,7 @@ tr.infra_error{{background:#fff3cd}}</style>
 <h2>Resolved {h['resolved']} / {h['total']} ({_fmt(h['resolved_pct_of_total'], 1)}% of total,
 {_fmt(h['resolved_pct_of_attempted'], 1)}% of {h['attempted']} attempted)</h2>
 <ul>{counts}</ul>
+{providers}
 <p>Cost: {_fmt(r['totals']['cost_usd'])} USD · instance time {r['totals']['instance_seconds']}s</p>
 <table><tr><th>Instance</th><th>Status</th><th>Tokens in/out</th><th>Cost USD</th><th>Wall s</th><th>Steps</th><th>Links</th></tr>
 {rows}</table>"""

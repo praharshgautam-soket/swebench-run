@@ -1,0 +1,27 @@
+# For a single 16 vCPU / 64 GB VM running k3s (see docs/VM-SETUP.md). Same as loop-full.yaml,
+# with no node restriction and no priority class, since you own the machine.
+run_id: vm-loop-v070
+provider:
+  kind: soket
+  model: GLM-5.3
+harness:
+  name: loop
+  options:
+    version: v0.7.0
+dataset:
+  name: princeton-nlp/SWE-bench_Lite
+  split: test
+workers: 8                          # use 4 on an 8 vCPU / 32 GB machine
+limits:
+  timeout_sec: 1800
+  eval_timeout_sec: 1800
+k8s:
+  namespace: swebench
+  cpu_request: "1"
+  cpu_limit: "2"
+  memory_request: 2Gi
+  memory_limit: 6Gi
+meter:
+  enabled: true
+output_dir: results
+max_retries: 2

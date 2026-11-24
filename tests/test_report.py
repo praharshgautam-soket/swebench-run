@@ -80,3 +80,50 @@ def test_write_report_files_and_predictions_format(cfg):
     assert {r["instance_id"] for r in rows} == {s.instance_id for s in sample()}
     assert set(rows[0]) == {"instance_id", "model_name_or_path", "model_patch"}
     assert rows[0]["model_name_or_path"] == "loop__m"
+
+
+def tagged(iid, ev, provider, model):
+    s = state(iid, INF_OK, ev)
+    s.provider, s.model = provider, model
+    return s
+
+
+def test_mixed_providers_are_split_in_the_report(cfg):
+    states = [
+        tagged("a__a-1", EV_RESOLVED, "soket", "GLM-5.3"),
+        tagged("b__b-2", EV_UNRESOLVED, "soket", "GLM-5.3"),
+        tagged("c__c-3", EV_RESOLVED, "openrouter", "z-ai/glm-5.3"),
+        tagged("d__d-4", EV_RESOLVED, "openrouter", "z-ai/glm-5.3"),
+        state("e__e-5", INF_OK, EV_RESOLVED),  # recorded before provider tracking
+    ]
+    r = build_report(cfg, states)
+    assert r["mixed_providers"] is True
+    assert r["by_provider"]["soket/GLM-5.3"] == {"tasks": 2, "resolved": 1, "resolved_pct": 50.0}
+    assert r["by_provider"]["openrouter/z-ai/glm-5.3"]["resolved"] == 2
+    assert r["by_provider"]["unrecorded"]["tasks"] == 1
+    md = render_markdown(r)
+    assert "mixes providers" in md and "soket/GLM-5.3" in md
+    assert "mixes providers" in render_html(r)
+
+
+def test_single_provider_report_has_no_mixed_banner(cfg):
+    r = build_report(cfg, [tagged("a__a-1", EV_RESOLVED, "soket", "GLM-5.3")])
+    assert r["mixed_providers"] is False
+    assert "mixes providers" not in render_markdown(r)
+
+
+def test_infra_and_pending_tasks_are_not_counted_in_provider_split(cfg):
+    states = [tagged("a__a-1", EV_RESOLVED, "soket", "GLM-5.3"), state("c__c-3", INF_INFRA, patch=0)]
+    assert build_report(cfg, states)["by_provider"]["soket/GLM-5.3"]["tasks"] == 1
+
+
+def test_predictions_use_the_model_each_task_actually_ran_on(cfg):
+    store = Store(cfg.run_dir)
+    for s in (tagged("a__a-1", EV_RESOLVED, "soket", "GLM-5.3"),
+              tagged("b__b-2", EV_RESOLVED, "openrouter", "z-ai/glm-5.3")):
+        store.save(s)
+        store.write(s.instance_id, "patch.diff", "p\n")
+    write_report(cfg, store, total_instances=2)
+    rows = {json.loads(l)["instance_id"]: json.loads(l)["model_name_or_path"]
+            for l in (store.root / "predictions.jsonl").read_text().splitlines()}
+    assert rows == {"a__a-1": "loop__GLM-5.3", "b__b-2": "loop__z-ai/glm-5.3"}

@@ -74,6 +74,10 @@ class InstanceState:
     input_tokens: int | None = None
     output_tokens: int | None = None
     cost_usd: float | None = None
+    # Which provider/model produced the agent's patch. None for results recorded before
+    # this was tracked (see `swebench-run tag-existing`).
+    provider: str | None = None
+    model: str | None = None
 
     # -- decisions --------------------------------------------------------
 
@@ -122,6 +126,8 @@ class InstanceState:
             input_tokens=d.get("input_tokens"),
             output_tokens=d.get("output_tokens"),
             cost_usd=d.get("cost_usd"),
+            provider=d.get("provider"),
+            model=d.get("model"),
         )
 
 

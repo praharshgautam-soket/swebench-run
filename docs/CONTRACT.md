@@ -3,10 +3,15 @@
 A harness is a *bundle*, not controller code. The controller mounts the bundle into
 the SWE-bench instance pod and calls the same entrypoint for every harness.
 
-## Bundle layout (image, copied to `/harness` by an init container)
+## Bundle layout (copied to `/harness` by an init container)
+
+Two delivery modes: **image mode** (`k8s.harness_image`, needs a registry) or **fetch mode**
+(default when it is empty): the init container downloads the agent from the harness's release URL,
+verifies its `.sha256`, and the two scripts come from the pod's ConfigMap. Fetch mode needs pods to reach the
+internet.
 
 ```
-/opt/harness/entrypoint.sh   shared, from bundles/common (timeout, patch capture, packaging)
+/opt/harness/entrypoint.sh   shared, from src/swebench_run/bundles/common (timeout, patch capture, packaging)
 /opt/harness/run-agent.sh    the only harness-specific file
 /opt/harness/bin/...         the agent itself
 ```
@@ -48,6 +53,6 @@ says so), because the kubelet rotates logs. A pod that ends without a block is a
 
 ## Adding a harness
 
-1. `bundles/<name>/Dockerfile` (copy the shared entrypoint, install the agent) and `run-agent.sh`.
+1. `src/swebench_run/bundles/<name>/run-agent.sh`, plus a `Dockerfile` if you want an image.
 2. One entry in `src/swebench_run/harnesses.py` (name and the option keys it accepts).
 3. Set `harness.name` and `k8s.harness_image` in the run config. Nothing else changes.

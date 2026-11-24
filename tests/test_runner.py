@@ -186,3 +186,181 @@ def test_empty_patch_is_never_graded_as_resolved(cfg):
     runner.evaluate(runner.instances["a__a-1"], patch="")
     assert store.load("a__a-1").final_status != "resolved"
     assert cluster.calls == []
+
+
+class FakeMeter:
+    def __init__(self, stats=None, fail=False, healthy=True):
+        self.stats, self.fail, self.resets, self._healthy = stats, fail, [], healthy
+
+    def healthy(self):
+        return self._healthy
+
+    def reset(self, key):
+        if self.fail:
+            raise ConnectionError("proxy down")
+        self.resets.append(key)
+
+    def usage(self, key):
+        if self.fail:
+            raise ConnectionError("proxy down")
+        return self.stats
+
+
+def test_meter_numbers_fill_tokens_steps_and_cost(cfg):
+    from swebench_run.manifests import instance_key
+
+    meter = FakeMeter({"calls": 13, "ok_calls": 12, "prompt_tokens": 2_000_000, "completion_tokens": 500_000})
+    cluster = FakeCluster(
+        inference={"a__a-1": PodResult("completed", logs=result_log())},
+        evaluation={"a__a-1": ok_eval(True)},
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = meter
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert (s.input_tokens, s.output_tokens, s.steps) == (2_000_000, 500_000, 12)
+    assert s.cost_usd == 3.0
+    assert meter.resets == [instance_key("a__a-1")]
+
+
+def test_meter_failure_never_fails_the_instance(cfg):
+    cluster = FakeCluster(
+        inference={"a__a-1": PodResult("completed", logs=result_log())},
+        evaluation={"a__a-1": ok_eval(True)},
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = FakeMeter(fail=True)
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert s.final_status == "resolved" and s.input_tokens is None
+
+
+def test_meter_resets_only_on_first_attempt_so_retries_accumulate(cfg):
+    meter = FakeMeter({"calls": 1, "ok_calls": 1, "prompt_tokens": 10, "completion_tokens": 5})
+    cluster = FakeCluster(
+        inference={"a__a-1": [PodResult("infra", "node lost"), PodResult("completed", logs=result_log())]},
+        evaluation={"a__a-1": ok_eval(True)},
+    )
+    runner, _ = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = meter
+    runner.run(["a__a-1"])
+    assert len(meter.resets) == 1
+
+
+def test_report_can_fill_missing_usage_from_the_meter_without_overwriting(cfg):
+    from swebench_run.manifests import instance_key
+    from swebench_run.runner import fill_usage_from_meter
+
+    cluster = FakeCluster(
+        inference={i: PodResult("completed", logs=result_log()) for i in ("a__a-1", "b__b-2")},
+        evaluation={i: ok_eval(True) for i in ("a__a-1", "b__b-2")},
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1", "b__b-2"])
+    runner.run(["a__a-1", "b__b-2"])  # no meter during the run
+    assert store.load("a__a-1").input_tokens is None
+
+    seen = {instance_key("a__a-1"): {"calls": 4, "ok_calls": 3, "prompt_tokens": 1000, "completion_tokens": 200}}
+
+    class M:
+        def usage(self, key):
+            return seen.get(key)
+
+    assert fill_usage_from_meter(cfg, store, M(), log=lambda m: None) == 1
+    a, b = store.load("a__a-1"), store.load("b__b-2")
+    assert (a.input_tokens, a.output_tokens, a.steps) == (1000, 200, 3)
+    assert b.input_tokens is None  # the meter knew nothing about it: stays n/a
+    seen[instance_key("a__a-1")]["prompt_tokens"] = 999_999
+    assert fill_usage_from_meter(cfg, store, M(), log=lambda m: None) == 0  # not overwritten
+    assert store.load("a__a-1").input_tokens == 1000
+
+
+def test_agent_failure_while_the_meter_is_down_is_infra_and_retried(cfg):
+    meter = FakeMeter({"calls": 2, "ok_calls": 2, "prompt_tokens": 5, "completion_tokens": 1}, healthy=False)
+    state = {"n": 0}
+
+    class Flip(FakeCluster):
+        def run_pod(self, configmap, pod, *a):
+            if pod["metadata"]["labels"]["swebench-run/stage"] == "inference":
+                state["n"] += 1
+                if state["n"] == 2:
+                    meter._healthy = True  # the proxy came back before the retry
+            return super().run_pod(configmap, pod, *a)
+
+    cluster = Flip(
+        inference={"a__a-1": [PodResult("completed", logs=result_log(patch="", status="agent_error")),
+                              PodResult("completed", logs=result_log())]},
+        evaluation={"a__a-1": ok_eval(True)},
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = meter
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert s.inference.attempts == 2 and s.final_status == "resolved"
+
+
+def test_agent_failure_with_a_healthy_meter_stays_a_final_agent_error(cfg):
+    cluster = FakeCluster(
+        inference={"a__a-1": [PodResult("completed", logs=result_log(patch="", status="agent_error"))]}
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = FakeMeter({"calls": 1, "ok_calls": 1, "prompt_tokens": 5, "completion_tokens": 1}, healthy=True)
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert s.final_status == "agent_error" and s.inference.attempts == 1
+
+
+def test_each_task_records_the_provider_and_model_that_ran_it(cfg):
+    cluster = FakeCluster(
+        inference={"a__a-1": PodResult("completed", logs=result_log())},
+        evaluation={"a__a-1": ok_eval(True)},
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert (s.provider, s.model) == ("openrouter", "m")
+
+
+def test_infra_failures_are_not_tagged_with_a_provider(cfg):
+    cluster = FakeCluster(inference={"a__a-1": [PodResult("infra", "node lost")]})
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.run(["a__a-1"])
+    assert store.load("a__a-1").provider is None
+
+
+def test_agent_run_where_every_api_call_failed_is_infra_not_a_final_agent_error(cfg):
+    meter = FakeMeter({"calls": 3, "ok_calls": 0, "errors": 3, "prompt_tokens": 0, "completion_tokens": 0}, healthy=True)
+    cluster = FakeCluster(
+        inference={"a__a-1": [PodResult("completed", logs=result_log(patch="", status="agent_error"))]}
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = meter
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert s.final_status == "infra_error"
+    assert "rejected every call" in s.inference.error
+    assert s.inference.attempts == cfg.max_retries + 1  # retried, then gave up as infra
+
+
+def test_agent_failure_after_some_successful_calls_stays_agent_error(cfg):
+    meter = FakeMeter({"calls": 5, "ok_calls": 4, "prompt_tokens": 10, "completion_tokens": 2}, healthy=True)
+    cluster = FakeCluster(
+        inference={"a__a-1": [PodResult("completed", logs=result_log(patch="", status="agent_error"))]}
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = meter
+    runner.run(["a__a-1"])
+    assert store.load("a__a-1").final_status == "agent_error"
+
+
+def test_agent_failure_after_the_api_cut_a_stream_is_infra_and_retried(cfg):
+    meter = FakeMeter({"calls": 5, "ok_calls": 4, "truncated": 1, "prompt_tokens": 10, "completion_tokens": 2}, healthy=True)
+    cluster = FakeCluster(
+        inference={"a__a-1": [PodResult("completed", logs=result_log(patch="", status="agent_error"))]}
+    )
+    runner, store = make_runner(cfg, cluster, ["a__a-1"])
+    runner.meter = meter
+    runner.run(["a__a-1"])
+    s = store.load("a__a-1")
+    assert s.final_status == "infra_error"
+    assert "cut 1 streamed answer" in s.inference.error
+    assert s.inference.attempts == cfg.max_retries + 1

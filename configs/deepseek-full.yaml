@@ -1,0 +1,23 @@
+# DeepSeek Harness (dsh 0.2.1-rc.5) on all 300 tasks. Needs the in-cluster package cache:
+#   swebench-run cache-up -c configs/deepseek-full.yaml
+run_id: dsh-full
+provider:
+  kind: soket
+  model: GLM-5.3
+harness:
+  name: deepseek
+  options:
+    web: "off"                      # "off" (default) disables dsh's web tool
+dataset:
+  name: princeton-nlp/SWE-bench_Lite
+  split: test
+workers: 8
+limits:
+  timeout_sec: 1800
+  eval_timeout_sec: 1800
+k8s:
+  namespace: swebench
+meter:
+  enabled: true
+output_dir: results
+max_retries: 2

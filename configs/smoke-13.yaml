@@ -1,0 +1,25 @@
+# Smoke test: Loop on the first 13 SWE-bench Lite tasks. Run this before a full run.
+# About an hour with 2 workers. Needs: export SOKET_API_KEY=...   (any OpenAI-compatible key works)
+run_id: smoke-13
+provider:
+  kind: soket                       # preset: base_url https://api.soket.ai/v1, key env SOKET_API_KEY
+  model: GLM-5.3
+harness:
+  name: loop
+  options:
+    version: v0.7.0                 # a Loop release tag; v0.7.0 is the default
+dataset:
+  name: princeton-nlp/SWE-bench_Lite
+  split: test
+  subset:
+    first_n: 13
+workers: 2
+limits:
+  timeout_sec: 1800                 # per task, agent stage
+  eval_timeout_sec: 1800            # per task, grading stage
+k8s:
+  namespace: swebench
+meter:
+  enabled: true                     # counts tokens and steps; retries rate limits
+output_dir: results
+max_retries: 2

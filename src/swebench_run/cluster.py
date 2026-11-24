@@ -6,9 +6,11 @@ nothing else needs a kubeconfig).
 """
 from __future__ import annotations
 
+import random
+import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 # Container waiting reasons that mean the image will not arrive on its own.
 PULL_FAILURES = {"ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull"}
@@ -27,6 +29,30 @@ class Cluster(Protocol):
     def run_pod(
         self, configmap: dict[str, Any], pod: dict[str, Any], start_timeout: int, run_timeout: int
     ) -> PodResult: ...
+
+
+TRANSIENT_STATUSES = {409, 429, 500, 502, 503, 504}
+
+
+def is_transient_api_error(e: Exception) -> bool:
+    """Conflicts and brief server trouble. Many workers creating pods at once update the
+    namespace's ResourceQuota together, which Kubernetes answers with 409 (or, when the
+    conflict is reported as an admission failure, a 403 that mentions the quota)."""
+    status = getattr(e, "status", None)
+    if status in TRANSIENT_STATUSES:
+        return True
+    return status == 403 and "quota" in api_message(e).lower()
+
+
+def retry_transient(fn: Callable[[], Any], tries: int = 8, sleep: Callable[[float], None] = time.sleep) -> Any:
+    """Call `fn`, retrying transient Kubernetes API errors with short jittered backoff."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001 - only API errors with a transient status are retried
+            if attempt == tries - 1 or not is_transient_api_error(e):
+                raise
+            sleep(min(0.3 * 2**attempt, 5.0) + random.random() * 0.5)
 
 
 def classify_pod(pod: Any, pending_for_sec: float, start_timeout: int) -> PodResult | None:
@@ -71,6 +97,33 @@ def classify_pod(pod: Any, pending_for_sec: float, start_timeout: int) -> PodRes
     return None
 
 
+def deployment_rolled_out(dep: Any) -> bool:
+    """True only when the *new* pods have fully replaced the old ones.
+
+    Ready-count alone is not enough: during a rollout the old pod stays ready and keeps
+    serving (with the old settings) until the new one is up and the old one is gone.
+    """
+    want = dep.spec.replicas or 1
+    st = dep.status
+    return (
+        (st.observed_generation or 0) >= (dep.metadata.generation or 0)
+        and (st.updated_replicas or 0) == want
+        and (st.replicas or 0) == want
+        and (st.ready_replicas or 0) == want
+    )
+
+
+def api_message(e: Exception) -> str:
+    """The human-readable message Kubernetes put in an API error (no request data, no secrets)."""
+    import json
+
+    try:
+        msg = json.loads(getattr(e, "body", "") or "{}").get("message", "")
+    except ValueError:
+        msg = ""
+    return msg[:400]
+
+
 class KubeCluster:
     def __init__(self, namespace: str, poll_sec: float = 5.0):
         from kubernetes import client, config
@@ -83,6 +136,8 @@ class KubeCluster:
         self.client = client
         self.ns = namespace
         self.poll_sec = poll_sec
+        # Creating pods one at a time (it takes ~100 ms) avoids most quota update conflicts.
+        self._create_lock = threading.Lock()
 
     def ensure_secret(self, name: str, key: str, value: str) -> None:
         body = self.client.V1Secret(
@@ -109,11 +164,12 @@ class KubeCluster:
         cm_name = configmap["metadata"]["name"]
         self._delete_leftovers(name, cm_name)
         try:
-            self.core.create_namespaced_config_map(self.ns, configmap)
-            self.core.create_namespaced_pod(self.ns, pod)
+            with self._create_lock:
+                retry_transient(lambda: self.core.create_namespaced_config_map(self.ns, configmap))
+                retry_transient(lambda: self.core.create_namespaced_pod(self.ns, pod))
             return self._wait(name, start_timeout, run_timeout)
         except self.client.ApiException as e:
-            return PodResult("infra", f"kubernetes API error {e.status}: {e.reason}")
+            return PodResult("infra", f"kubernetes API error {e.status}: {e.reason}: {api_message(e)}")
         finally:
             self._delete_leftovers(name, cm_name)
 
@@ -162,3 +218,98 @@ class KubeCluster:
             if e.status != 409:
                 raise
             apps.replace_namespaced_daemon_set(name, self.ns, ds)
+
+    # -- metering proxy ---------------------------------------------------
+
+    def read_secret_value(self, name: str, key: str) -> str | None:
+        import base64
+
+        try:
+            sec = self.core.read_namespaced_secret(name, self.ns)
+        except self.client.ApiException as e:
+            if e.status == 404:
+                return None
+            raise
+        raw = (sec.data or {}).get(key)
+        return base64.b64decode(raw).decode() if raw else None
+
+    def meter_client(self, name: str, port: int, secret_name: str):
+        from .meter import KubeMeterClient
+
+        token = self.read_secret_value(secret_name, "meter-token")
+        if not token:
+            raise RuntimeError(f"secret {secret_name!r} has no meter-token; run `swebench-run meter-up` first")
+        return KubeMeterClient(self.client.ApiClient(), self.ns, name, port, token)
+
+    def meter_up(self, configmap: dict, deployment: dict, service: dict,
+                 secret_name: str, upstream_key: str) -> None:
+        """Create or update the proxy. An existing meter token is kept, so running pods keep working."""
+        import secrets
+
+        token = self.read_secret_value(secret_name, "meter-token") or secrets.token_urlsafe(24)
+        body = self.client.V1Secret(
+            metadata=self.client.V1ObjectMeta(name=secret_name, namespace=self.ns),
+            string_data={"upstream-key": upstream_key, "meter-token": token},
+        )
+        try:
+            self.core.create_namespaced_secret(self.ns, body)
+        except self.client.ApiException as e:
+            if e.status != 409:
+                raise
+            self.core.replace_namespaced_secret(secret_name, self.ns, body)
+
+        apps = self.client.AppsV1Api()
+        for create, replace, name, obj in (
+            (self.core.create_namespaced_config_map, self.core.replace_namespaced_config_map,
+             configmap["metadata"]["name"], configmap),
+            (apps.create_namespaced_deployment, apps.replace_namespaced_deployment,
+             deployment["metadata"]["name"], deployment),
+            (self.core.create_namespaced_service, self.core.patch_namespaced_service,
+             service["metadata"]["name"], service),
+        ):
+            try:
+                create(self.ns, obj)
+            except self.client.ApiException as e:
+                if e.status != 409:
+                    raise
+                replace(name, self.ns, obj)
+
+    def apply_workload(self, configmap: dict, deployment: dict, service: dict) -> None:
+        """Create or replace a ConfigMap, Deployment and Service (used by the agent cache pod)."""
+        apps = self.client.AppsV1Api()
+        for create, replace, name, obj in (
+            (self.core.create_namespaced_config_map, self.core.replace_namespaced_config_map,
+             configmap["metadata"]["name"], configmap),
+            (apps.create_namespaced_deployment, apps.replace_namespaced_deployment,
+             deployment["metadata"]["name"], deployment),
+            (self.core.create_namespaced_service, self.core.patch_namespaced_service,
+             service["metadata"]["name"], service),
+        ):
+            try:
+                create(self.ns, obj)
+            except self.client.ApiException as e:
+                if e.status != 409:
+                    raise
+                replace(name, self.ns, obj)
+
+    def wait_deployment_ready(self, name: str, timeout_sec: int = 300) -> bool:
+        apps = self.client.AppsV1Api()
+        deadline = time.monotonic() + timeout_sec
+        while time.monotonic() < deadline:
+            dep = apps.read_namespaced_deployment_status(name, self.ns)
+            if deployment_rolled_out(dep):
+                return True
+            time.sleep(self.poll_sec)
+        return False
+
+    def meter_down(self, name: str) -> None:
+        """Remove the proxy's deployment, service and configmap (not the secret)."""
+        apps = self.client.AppsV1Api()
+        for fn in (lambda: apps.delete_namespaced_deployment(name, self.ns),
+                   lambda: self.core.delete_namespaced_service(name, self.ns),
+                   lambda: self.core.delete_namespaced_config_map(name, self.ns)):
+            try:
+                fn()
+            except self.client.ApiException as e:
+                if e.status != 404:
+                    raise

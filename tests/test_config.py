@@ -34,13 +34,15 @@ def test_unknown_key_rejected():
         RunConfig.from_dict(base(limits={"timeout": 5}))
 
 
-def test_soket_needs_explicit_base_url():
-    with pytest.raises(ConfigError, match="base_url"):
-        RunConfig.from_dict({"provider": {"kind": "soket", "model": "m"}})
-    cfg = RunConfig.from_dict(
-        {"provider": {"kind": "soket", "model": "m", "base_url": "https://example.test/v1"}}
-    )
+def test_soket_defaults_to_its_public_endpoint_and_key_var():
+    cfg = RunConfig.from_dict({"provider": {"kind": "soket", "model": "m"}})
+    assert cfg.provider.base_url == "https://api.soket.ai/v1"
     assert cfg.provider.api_key_env == "SOKET_API_KEY"
+
+
+def test_openai_compatible_needs_explicit_base_url():
+    with pytest.raises(ConfigError, match="base_url"):
+        RunConfig.from_dict({"provider": {"kind": "openai-compatible", "model": "m", "api_key_env": "K"}})
 
 
 @pytest.mark.parametrize(
@@ -78,3 +80,11 @@ def test_select_instances():
     assert select_instances(ids, Subset(instance_ids=["c", "a", "c"])) == ["c", "a"]
     with pytest.raises(ConfigError, match="unknown instance"):
         select_instances(ids, Subset(instance_ids=["zzz"]))
+
+
+def test_pasted_api_key_is_rejected_and_never_echoed():
+    secret = "sk-LUvh-not-a-real-key_123"
+    with pytest.raises(ConfigError) as err:
+        RunConfig.from_dict({"provider": {"kind": "soket", "model": "m", "api_key_env": secret}})
+    assert "NAME of an environment variable" in str(err.value)
+    assert secret not in str(err.value)

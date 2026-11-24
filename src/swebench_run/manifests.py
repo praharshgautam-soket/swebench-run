@@ -1,7 +1,8 @@
 """Pure builders for the Kubernetes objects a run needs (plain dicts, no client).
 
-Inference pod:  instance image + an init container that copies the harness bundle
-                into an emptyDir, so the huge instance images are never rebuilt.
+Inference pod:  instance image + an init container that puts the harness bundle into an
+                emptyDir (from a bundle image, or by downloading the agent), so the huge
+                instance images are never rebuilt.
 Evaluation pod: a fresh pod from the same instance image; patch and eval script
                 arrive via ConfigMap.
 The API key is only ever referenced through secretKeyRef, never written out.
@@ -13,7 +14,7 @@ from importlib import resources
 from typing import Any
 
 from .config import RunConfig
-from .harnesses import get_harness, harness_image
+from .harnesses import get_harness
 
 # ConfigMap objects are capped at 1 MiB in total.
 CONFIGMAP_LIMIT_BYTES = 900_000
@@ -27,12 +28,17 @@ def slug(run_id: str, instance_id: str, stage: str) -> str:
     return f"sbr-{run_id}-{stage}-{h}"[:63].rstrip("-")
 
 
+def instance_key(instance_id: str) -> str:
+    """Short stable id for an instance; used in labels and in the meter's URL path."""
+    return hashlib.sha1(instance_id.encode()).hexdigest()[:10]
+
+
 def labels(cfg: RunConfig, instance_id: str, stage: str) -> dict[str, str]:
     return {
         "app.kubernetes.io/managed-by": "swebench-run",
         "swebench-run/run": cfg.run_id,
         "swebench-run/stage": stage,
-        "swebench-run/instance": hashlib.sha1(instance_id.encode()).hexdigest()[:10],
+        "swebench-run/instance": instance_key(instance_id),
     }
 
 
@@ -52,6 +58,12 @@ def _resources(cfg: RunConfig) -> dict[str, Any]:
     }
 
 
+INIT_RESOURCES = {
+    "requests": {"cpu": "100m", "memory": "64Mi", "ephemeral-storage": "100Mi"},
+    "limits": {"cpu": "1", "memory": "256Mi", "ephemeral-storage": "1Gi"},
+}
+
+
 def _pod_common(cfg: RunConfig) -> dict[str, Any]:
     spec: dict[str, Any] = {
         "restartPolicy": "Never",
@@ -60,6 +72,26 @@ def _pod_common(cfg: RunConfig) -> dict[str, Any]:
     }
     if cfg.k8s.tolerations:
         spec["tolerations"] = cfg.k8s.tolerations
+    if cfg.k8s.allowed_nodes:
+        spec["affinity"] = {
+            "nodeAffinity": {
+                "requiredDuringSchedulingIgnoredDuringExecution": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "kubernetes.io/hostname",
+                                    "operator": "In",
+                                    "values": list(cfg.k8s.allowed_nodes),
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    if cfg.k8s.priority_class:
+        spec["priorityClassName"] = cfg.k8s.priority_class
     if cfg.k8s.image_pull_secrets:
         spec["imagePullSecrets"] = [{"name": n} for n in cfg.k8s.image_pull_secrets]
     return spec
@@ -86,20 +118,52 @@ def inference_objects(
     ns = cfg.k8s.namespace
     harness = get_harness(cfg.harness.name)
 
+    if cfg.meter.enabled:
+        # Agents never see the real key: they get the proxy's address and its own token.
+        base_url = meter_url(cfg, instance_id)
+        key_ref = {"name": cfg.meter.secret_name, "key": "meter-token"}
+    else:
+        base_url = cfg.provider.base_url
+        key_ref = {"name": cfg.k8s.secret_name, "key": cfg.k8s.secret_key}
+
     env: list[dict[str, Any]] = [
         {"name": "INSTANCE_ID", "value": instance_id},
         {"name": "MODEL", "value": cfg.provider.model},
-        {"name": "PROVIDER_BASE_URL", "value": cfg.provider.base_url},
+        {"name": "PROVIDER_BASE_URL", "value": base_url},
         {"name": "MAX_STEPS", "value": str(cfg.limits.max_steps)},
         {"name": "TIMEOUT_SEC", "value": str(cfg.limits.timeout_sec)},
-        {
-            "name": "LLM_API_KEY",
-            "valueFrom": {
-                "secretKeyRef": {"name": cfg.k8s.secret_name, "key": cfg.k8s.secret_key}
-            },
-        },
+        {"name": "LLM_API_KEY", "valueFrom": {"secretKeyRef": key_ref}},
     ]
     env += [{"name": k, "value": v} for k, v in harness.extra_env(cfg).items()]
+
+    task_data = {"problem.md": prompt}
+    task_mounts = [{"name": "harness", "mountPath": "/harness"}]
+    if cfg.k8s.harness_image:
+        init = {
+            "name": "harness",
+            "image": cfg.k8s.harness_image,
+            "imagePullPolicy": cfg.k8s.image_pull_policy,
+            "command": ["sh", "-c", "cp -a /opt/harness/. /harness/"],
+            "volumeMounts": task_mounts,
+            "resources": INIT_RESOURCES,
+        }
+    elif harness.can_fetch():
+        # Fetch mode: no registry. The scripts ride along in the task ConfigMap.
+        task_data.update(harness.scripts())
+        fetch_image, fetch_cmd, fetch_resources = harness.fetch_init(cfg)
+        init = {
+            "name": "harness",
+            "image": fetch_image,
+            "imagePullPolicy": cfg.k8s.image_pull_policy,
+            "command": ["sh", "-c", fetch_cmd],
+            "volumeMounts": task_mounts + [{"name": "task", "mountPath": "/task", "readOnly": True}],
+            "resources": fetch_resources,
+        }
+    else:
+        raise ValueError(
+            f"harness {harness.name!r} has no download URL; set k8s.harness_image to an image "
+            "holding the bundle (see src/swebench_run/bundles/<name>/Dockerfile)"
+        )
 
     pod = {
         "apiVersion": "v1",
@@ -113,15 +177,7 @@ def inference_objects(
         "spec": {
             **_pod_common(cfg),
             "activeDeadlineSeconds": cfg.limits.timeout_sec + DEADLINE_GRACE_SEC,
-            "initContainers": [
-                {
-                    "name": "harness",
-                    "image": harness_image(cfg),
-                    "imagePullPolicy": cfg.k8s.image_pull_policy,
-                    "command": ["sh", "-c", "cp -a /opt/harness/. /harness/"],
-                    "volumeMounts": [{"name": "harness", "mountPath": "/harness"}],
-                }
-            ],
+            "initContainers": [init],
             "containers": [
                 {
                     "name": "agent",
@@ -144,7 +200,144 @@ def inference_objects(
             ],
         },
     }
-    return configmap(name, ns, lbls, {"problem.md": prompt}), pod
+    return configmap(name, ns, lbls, task_data), pod
+
+
+def meter_url(cfg: RunConfig, instance_id: str) -> str:
+    """Base URL an agent should use: the proxy, tagged with the instance key."""
+    m = cfg.meter
+    return f"http://{m.name}.{cfg.k8s.namespace}.svc.cluster.local:{m.port}/i/{instance_key(instance_id)}"
+
+
+def meter_script_text() -> str:
+    return resources.files("swebench_run").joinpath("assets/meter_server.py").read_text()
+
+
+def meter_objects(cfg: RunConfig) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """(configmap, deployment, service) for the metering proxy."""
+    m, ns = cfg.meter, cfg.k8s.namespace
+    lbls = {"app.kubernetes.io/managed-by": "swebench-run", "app": m.name}
+    secret = lambda key: {"valueFrom": {"secretKeyRef": {"name": m.secret_name, "key": key}}}  # noqa: E731
+    env: list[dict[str, Any]] = [
+        {"name": "UPSTREAM_BASE_URL", "value": cfg.provider.base_url},
+        {"name": "UPSTREAM_API_KEY", **secret("upstream-key")},
+        {"name": "METER_TOKEN", **secret("meter-token")},
+        {"name": "PORT", "value": str(m.port)},
+        {"name": "MAX_CONCURRENCY", "value": str(m.max_concurrency)},
+        {"name": "MAX_RETRIES", "value": str(m.max_retries)},
+    ]
+    p = cfg.provider
+    if p.input_price_per_mtok is not None and p.output_price_per_mtok is not None:
+        env += [{"name": "PRICE_IN", "value": str(p.input_price_per_mtok)},
+                {"name": "PRICE_OUT", "value": str(p.output_price_per_mtok)}]
+        if cfg.limits.max_cost_usd is not None:
+            env.append({"name": "BUDGET_USD", "value": str(cfg.limits.max_cost_usd)})
+    cm = configmap(m.name, ns, lbls, {"meter_server.py": meter_script_text()})
+    deployment = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": m.name, "namespace": ns, "labels": lbls},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": m.name}},
+            "template": {
+                "metadata": {"labels": lbls},
+                "spec": {
+                    **_pod_common(cfg),
+                    "restartPolicy": "Always",
+                    "containers": [
+                        {
+                            "name": "meter",
+                            "image": m.image,
+                            "imagePullPolicy": cfg.k8s.image_pull_policy,
+                            "command": ["python", "/app/meter_server.py"],
+                            "env": env,
+                            "ports": [{"containerPort": m.port}],
+                            "readinessProbe": {"httpGet": {"path": "/healthz", "port": m.port},
+                                               "periodSeconds": 5},
+                            "resources": {
+                                "requests": {"cpu": "100m", "memory": "128Mi", "ephemeral-storage": "100Mi"},
+                                "limits": {"cpu": "1", "memory": "512Mi", "ephemeral-storage": "1Gi"},
+                            },
+                            "volumeMounts": [{"name": "app", "mountPath": "/app", "readOnly": True}],
+                        }
+                    ],
+                    "volumes": [{"name": "app", "configMap": {"name": m.name}}],
+                },
+            },
+        },
+    }
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": m.name, "namespace": ns, "labels": lbls},
+        "spec": {"selector": {"app": m.name},
+                 "ports": [{"port": m.port, "targetPort": m.port}]},
+    }
+    return cm, deployment, service
+
+
+def cache_objects(cfg: RunConfig) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """(configmap, deployment, service) for the agent cache pod of a cache-mode harness."""
+    harness = get_harness(cfg.harness.name)
+    if not harness.cache:
+        raise ValueError(f"harness {harness.name!r} does not use a cache pod")
+    c, ns = harness.cache, cfg.k8s.namespace
+    assets = resources.files("swebench_run").joinpath("assets")
+    lbls = {"app.kubernetes.io/managed-by": "swebench-run", "app": c.service}
+    cm = configmap(
+        c.service,
+        ns,
+        lbls,
+        {"cache.sh": assets.joinpath("dsh_cache.sh").read_text(),
+         "cache_serve.js": assets.joinpath("cache_serve.js").read_text()},
+    )
+    deployment = {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": c.service, "namespace": ns, "labels": lbls},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": c.service}},
+            "template": {
+                "metadata": {"labels": lbls},
+                "spec": {
+                    **_pod_common(cfg),
+                    "restartPolicy": "Always",
+                    "containers": [
+                        {
+                            "name": "cache",
+                            "image": c.image,
+                            "imagePullPolicy": cfg.k8s.image_pull_policy,
+                            "command": ["sh", "/app/cache.sh"],
+                            "env": [
+                                {"name": "PACKAGE", "value": c.package},
+                                {"name": "VERSION", "value": c.version},
+                                {"name": "PORT", "value": str(c.port)},
+                            ],
+                            "ports": [{"containerPort": c.port}],
+                            # Ready only once the tarball and its checksum exist.
+                            "readinessProbe": {"httpGet": {"path": "/healthz", "port": c.port},
+                                               "periodSeconds": 10, "failureThreshold": 3},
+                            "resources": {
+                                "requests": {"cpu": "500m", "memory": "1Gi", "ephemeral-storage": "2Gi"},
+                                "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "6Gi"},
+                            },
+                            "volumeMounts": [{"name": "app", "mountPath": "/app", "readOnly": True}],
+                        }
+                    ],
+                    "volumes": [{"name": "app", "configMap": {"name": c.service}}],
+                },
+            },
+        },
+    }
+    service = {
+        "apiVersion": "v1",
+        "kind": "Service",
+        "metadata": {"name": c.service, "namespace": ns, "labels": lbls},
+        "spec": {"selector": {"app": c.service}, "ports": [{"port": c.port, "targetPort": c.port}]},
+    }
+    return cm, deployment, service
 
 
 def eval_script_text() -> str:

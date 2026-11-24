@@ -59,3 +59,22 @@ def test_unschedulable_after_timeout():
     cond = NS(type="PodScheduled", status="False", message="0/3 nodes: insufficient cpu", reason="Unschedulable")
     r = classify_pod(pod("Pending", conditions=[cond]), 2000, 1800)
     assert r.kind == "infra" and "unschedulable" in r.reason
+
+
+def _dep(gen=2, observed=2, want=1, updated=1, replicas=1, ready=1):
+    return NS(
+        metadata=NS(generation=gen),
+        spec=NS(replicas=want),
+        status=NS(observed_generation=observed, updated_replicas=updated, replicas=replicas, ready_replicas=ready),
+    )
+
+
+def test_rollout_is_done_only_when_new_pods_replaced_the_old_ones():
+    from swebench_run.cluster import deployment_rolled_out
+
+    assert deployment_rolled_out(_dep())
+    # old pod still serving while the new one starts: 2 pods, only 1 updated
+    assert not deployment_rolled_out(_dep(updated=1, replicas=2, ready=1))
+    assert not deployment_rolled_out(_dep(updated=0, replicas=1, ready=1))  # nothing replaced yet
+    assert not deployment_rolled_out(_dep(observed=1, gen=2))  # controller hasn't seen the change
+    assert not deployment_rolled_out(_dep(ready=0))
